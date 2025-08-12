@@ -1,5 +1,5 @@
 {
-  "videoCodec": "h264",
+  "videoCodec": "libx264",
   "audioCodec": "aac",
   "resolution": "1920x1080",
   "bitrate": 974,
