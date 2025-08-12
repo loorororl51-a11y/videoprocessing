@@ -1,0 +1,145 @@
+name: Video Processing Pipeline
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'  # Check every 5 minutes for new videos
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  process-video:
+    runs-on: ubuntu-latest
+    
+    env:
+      GOOGLE_DRIVE_CLIENT_ID: ${{ secrets.GOOGLE_DRIVE_CLIENT_ID }}
+      GOOGLE_DRIVE_CLIENT_SECRET: ${{ secrets.GOOGLE_DRIVE_CLIENT_SECRET }}
+      GOOGLE_DRIVE_REDIRECT_URI: ${{ secrets.GOOGLE_DRIVE_REDIRECT_URI }}
+      GOOGLE_DRIVE_REFRESH_TOKEN: ${{ secrets.GOOGLE_DRIVE_REFRESH_TOKEN }}
+      INPUT_FOLDER_ID: "1EurKyDd3HehsL70p5NWbHSlM0V7km6bh"
+      OUTPUT_FOLDER_ID: "1VVj6pT4pWW9Nn18cQSh2XurQnGk1RHHF"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          pip install google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client
+
+      - name: Load video preset
+        id: preset
+        run: |
+          echo "VIDEO_PRESET=$(cat video-preset.json)" >> $GITHUB_ENV
+
+      - name: Check for new videos and process
+        run: |
+          python - <<EOF
+          import os
+          from google.oauth2.credentials import Credentials
+          from google.oauth2.credentials import Credentials
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
+          import datetime
+          import json
+
+          def get_google_drive_service():
+              creds = Credentials(
+                  None,
+                  refresh_token=os.environ['GOOGLE_DRIVE_REFRESH_TOKEN'],
+                  token_uri="https://oauth2.googleapis.com/token",
+                  client_id=os.environ['GOOGLE_DRIVE_CLIENT_ID'],
+                  client_secret=os.environ['GOOGLE_DRIVE_CLIENT_SECRET']
+              )
+              return build('drive', 'v3', credentials=creds)
+
+          def process_new_videos():
+              service = get_google_drive_service()
+              
+              # Get list of files in input folder
+              query = f"'{os.environ['INPUT_FOLDER_ID']}' in parents and mimeType contains 'video/' and not trashed"
+              results = service.files().list(
+                  q=query,
+                  fields="files(id, name, createdTime)"
+              ).execute()
+              
+              # Check each video file
+              for file in results.get('files', []):
+                  created_time = datetime.datetime.strptime(
+                      file['createdTime'], '%Y-%m-%dT%H:%M:%S.%fZ'
+                  )
+                  
+                  # Process only videos created in the last 10 minutes
+                  if (datetime.datetime.utcnow() - created_time).total_seconds() <= 600:
+                      print(f"Processing new video: {file['name']}")
+                      
+                      # Download video
+                      request = service.files().get_media(fileId=file['id'])
+                      with open('input_video.mp4', 'wb') as f:
+                          downloader = MediaIoBaseDownload(f, request)
+                          done = False
+                          while not done:
+                              _, done = downloader.next_chunk()
+                      
+                      # Process video using FFmpeg
+                      preset = json.loads(os.environ['VIDEO_PRESET'])
+                      os.system(f'''
+                          ffmpeg -i input_video.mp4 \
+                          -c:v {preset['videoCodec']} \
+                          -c:a {preset['audioCodec']} \
+                          -s {preset['resolution']} \
+                          -b:v {preset['bitrate']}k \
+                          -r {preset['fps']} \
+                          -ac {preset['audioChannels']} \
+                          -ar {preset['audioSampleRate']} \
+                          -movflags faststart \
+                          processed_video.mp4
+                      ''')
+                      
+                      # Create thumbnail
+                      os.system('ffmpeg -i processed_video.mp4 -ss 00:00:02 -vframes 1 thumbnail.jpg')
+                      
+                      # Check file size and split if necessary
+                      size_mb = os.path.getsize('processed_video.mp4') / (1024 * 1024)
+                      if size_mb > 98:
+                          os.system('ffmpeg -i processed_video.mp4 -c copy -f segment -segment_time 600 -reset_timestamps 1 part%d.mp4')
+                          # Upload parts
+                          for part in sorted([f for f in os.listdir('.') if f.startswith('part') and f.endswith('.mp4')]):
+                              media = MediaFileUpload(part, mimetype='video/mp4')
+                              file_metadata = {
+                                  'name': f"processed_{file['name']}_{part}",
+                                  'parents': [os.environ['OUTPUT_FOLDER_ID']]
+                              }
+                              service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+                      else:
+                          # Upload single processed video
+                          media = MediaFileUpload('processed_video.mp4', mimetype='video/mp4')
+                          file_metadata = {
+                              'name': f"processed_{file['name']}",
+                              'parents': [os.environ['OUTPUT_FOLDER_ID']]
+                          }
+                          service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+                      
+                      # Upload thumbnail
+                      media = MediaFileUpload('thumbnail.jpg', mimetype='image/jpeg')
+                      file_metadata = {
+                          'name': f"thumbnail_{file['name']}.jpg",
+                          'parents': [os.environ['OUTPUT_FOLDER_ID']]
+                      }
+                      service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+                      
+                      # Cleanup
+                      os.remove('input_video.mp4')
+                      os.remove('processed_video.mp4')
+                      os.remove('thumbnail.jpg')
+                      for f in [f for f in os.listdir('.') if f.startswith('part') and f.endswith('.mp4')]:
+                          os.remove(f)
+
+          if __name__ == '__main__':
+              process_new_videos()
+          EOF
